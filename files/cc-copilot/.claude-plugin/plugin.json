@@ -1,0 +1,1 @@
+{ "name": "cc-copilot", "version": "0.2.0", "description": "输入框上方的助手栏：发送前选模型和推理强度、可选的提示词增强、下一步建议", "types": "./types/index.d.ts" }
