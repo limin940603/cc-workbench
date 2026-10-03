@@ -109,3 +109,23 @@ test('状态栏：标题可改、账号可隐藏、长会话名按显示宽度�
   const b = strip(spawnSync(process.execPath, [statusline], { input, encoding: 'utf8', env: { ...process.env, CC_STATUS_HIDE_ACCOUNT: '1' } }).stdout);
   assert.doesNotMatch(b, /@/);
 });
+
+test('状态栏：实际回答的模型和会话默认不同时，显示实际模型（以转录为准）', () => {
+  const statusline = path.join(__dirname, '..', 'files', 'statusline.js');
+  const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccwb-sl-'));
+  const reply = (model, extra = {}) => JSON.stringify({ type: 'assistant', timestamp: new Date().toISOString(), message: { model, content: [{ type: 'text', text: 'ok' }] }, ...extra });
+  const render = (lines) => {
+    const tp = path.join(dir, `t${Math.random().toString(36).slice(2)}.jsonl`);
+    fs.writeFileSync(tp, lines.join('\n') + '\n');
+    const input = JSON.stringify({ model: { id: 'claude-fable-5-1', display_name: 'Fable 5.1' }, effort: 'high', transcript_path: tp, cwd: dir });
+    return strip(spawnSync(process.execPath, [statusline], { input, encoding: 'utf8' }).stdout).split('\n')[0];
+  };
+  // 主会话被助手栏改发给 Opus；子代理的回复和本地报错不算"实际模型"
+  const a = render([reply('claude-opus-5-5'), reply('claude-haiku-4-5-20251001', { isSidechain: true }), reply('<synthetic>')]);
+  assert.match(a, /^Opus 5\.5 上轮实际 · 默认 Fable 5\.1 · high/);
+  const b = render([reply('claude-fable-5-1')]);
+  assert.match(b, /^Fable 5\.1 · high/);
+  assert.doesNotMatch(b, /上轮实际/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});

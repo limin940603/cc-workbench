@@ -1,5 +1,5 @@
 // 输入框上方的助手栏：
-// 1. 发送前选模型和推理强度：只改之后发出的请求，不动 /model 的全局默认；
+// 1. 发送前选模型和推理强度：只改之后发出的请求，不动 /model 的全局默认；换了模型会在系统提示词里告诉它实际是谁；
 // 2. 「✨ 增强」按所选风格改写草稿（可选，不点就不发生），会参考最近对话，原稿可撤销；
 //    键盘党：草稿末尾加 ++ 再回车，不发送，改为增强后放回输入框；
 // 3. 每轮结束后预测"下一步"，作为栏内提示和输入框灰字建议（Tab 采用），可关；
@@ -242,6 +242,18 @@ export const register: Register = on => {
       return yield* next({ ...rest, model })
     }
     return yield* next({ ...e, model, effort })
+  })
+
+  // 系统提示词里"你是哪个模型"那句按会话模型写死，插件改不到；只改请求不补这段，模型会照着那句自称会话模型。
+  // 子代理不走这里（它们的请求也没被改写）；teammate 是别的循环借用主提示词，同样不补。
+  on('prompt.compose', async ($, e, next) => {
+    const r = await next(e)
+    const { model } = await read($, prefs)
+    if (model === null || model === e.model.replace(/\[1m\]$/i, '') || e.traits.includes('teammate')) return r
+    const label = labelOf(MODELS, model)
+    const text = `# 本会话实际回答的模型
+助手栏把主对话的请求改由 ${label}（模型 ID：${model}）发送，你就是 ${label}。上文按会话默认模型 ${e.model} 写的"你是哪个模型"的说法不适用于你；说明自己是哪个模型时以这里为准。`
+    return { sections: [...r.sections, { id: 'cc-copilot:model', text, scope: 'session' as const }] }
   })
 
   on('turn.complete', async ($, e, next) => {

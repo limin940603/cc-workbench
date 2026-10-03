@@ -25,6 +25,12 @@ const clipW = (str, max) => {
   return out;
 };
 
+// claude-opus-5-5 → Opus 5.5，claude-haiku-4-5-20251001 → Haiku 4.5；认不出的原样显示
+const modelName = (id) => {
+  const m = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(\[1m\])?$/i.exec(id);
+  return m ? `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}${m[3] ? '.' + m[3] : ''}${m[4] ? ' (1M)' : ''}` : id;
+};
+
 const readJSON = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
 const exists = (p) => { try { return fs.existsSync(p); } catch { return false; } };
 
@@ -37,12 +43,13 @@ function fmtDur(ms) {
 
 // ---------- 转录增量解析 ----------
 function newState() {
-  return { offset: 0, tools: {}, pending: {}, agents: {}, lastCtx: 0 };
+  return { offset: 0, tools: {}, pending: {}, agents: {}, lastCtx: 0, lastModel: '' };
 }
 function parseTranscript(tp) {
   if (!tp || !exists(tp)) return newState();
   const cacheFile = path.join(os.tmpdir(), 'cc-statusline-' + Buffer.from(tp).toString('base64url').slice(-40) + '.json');
-  let st = readJSON(cacheFile) || newState();
+  let st = readJSON(cacheFile);
+  if (!st || st.lastModel === undefined) st = newState(); // 旧版缓存缺新字段，整份重解析一次
   const size = fs.statSync(tp).size;
   if (size < st.offset) st = newState(); // 文件被重写（如压缩），重新解析
   if (size > st.offset) {
@@ -81,6 +88,8 @@ function ingest(st, d) {
     if (u && !d.isSidechain) {
       st.lastCtx = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
     }
+    // 实际回答的模型以回复记录为准：助手栏改发模型、限流降级时，会和会话默认模型不同。<synthetic> 是本地生成的报错提示，不算
+    if (!d.isSidechain && m.model && m.model !== '<synthetic>') st.lastModel = m.model;
     for (const b of m.content) {
       if (b.type !== 'tool_use' || d.isSidechain) continue;
       const inp = b.input || {};
@@ -164,7 +173,13 @@ process.stdin.on('end', () => {
   const email = (oa.emailAddress || '').replace(/^(.{4}).*(@.*)$/, '$1***$2');
   // 推理强度跟模型放一起：两者共同决定这一轮的质量和消耗
   const effort = typeof inp.effort === 'string' ? inp.effort : inp.effort?.level;
-  const l1 = [paint('bold', inp.model?.display_name || inp.model?.id || 'Claude') + (effort ? paint('dim', ' · ' + effort) : ''), path.basename(projectDir) || projectDir];
+  const shown = inp.model?.display_name || inp.model?.id || 'Claude';
+  // 输入里的 model/effort 只是会话默认；上一轮实际由别的模型回答时，实际模型放前面，默认值退为注释，免得被当成实际用的模型
+  const actual = st.lastModel && st.lastModel !== String(inp.model?.id || '').replace(/\[1m\]$/i, '') ? st.lastModel : '';
+  const head = actual
+    ? paint('bold', modelName(actual)) + paint('dim', ` 上轮实际 · 默认 ${shown}${effort ? ' · ' + effort : ''}`)
+    : paint('bold', shown) + (effort ? paint('dim', ' · ' + effort) : '');
+  const l1 = [head, path.basename(projectDir) || projectDir];
   if (inp.session_name) l1.push(paint('dim', clipW(inp.session_name, 28)));
   if (!HIDE_ACCOUNT && (email || plan)) l1.push(paint('dim', [email, plan].filter(Boolean).join(' · ')));
   if (inp.cost?.total_duration_ms) l1.push(paint('dim', fmtDur(inp.cost.total_duration_ms)));

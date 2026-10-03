@@ -100,6 +100,32 @@ test('发送前选模型和强度：主会话请求被改写，子代理和默�
   expect(seen.at(-1)).toMatchObject({ model: 'claude-fable-5-1', effort: 'medium', agentId: 'sub-1' })
 })
 
+test('换了发送模型：系统提示词末尾说明实际模型，跟随会话或选回会话模型时不加', async ($, on) => {
+  mock.store(on)
+  on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are powered by the model named Fable 5.1.', scope: 'shared' }] }))
+  const compose = (extra: object = {}) =>
+    $.prompt.compose({ model: 'claude-fable-5-1', promptModel: 'claude-fable-5-1', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [], ...extra })
+  const note = (r: { sections: readonly { id: string; text: string }[] }) => r.sections.find(s => s.id === 'cc-copilot:model')
+
+  expect(note(await compose())).toBeUndefined()
+
+  const ui = await $.ui.mount({ plugin: 'cc-copilot', surface: 'terminal', ...BAND } as any)
+  await ui.press({ key: 'more' })
+  for (let i = 0; i < 3; i++) {
+    await ui.redraw()
+    await ui.press({ key: 'model' }) // 跟随 → Haiku → Sonnet → Opus
+  }
+  const r = await compose()
+  expect(r.sections[0]?.id).toBe('intro') // 引擎原有的分段原样保留
+  expect(note(r)?.text).toContain('你就是 Opus 5.5')
+  expect(note(r)?.text).toContain('claude-opus-5-5')
+  expect(note(await compose({ traits: ['teammate'] }))).toBeUndefined()
+
+  await ui.redraw()
+  await ui.press({ key: 'model' }) // → Fable 5.1，与会话模型相同，请求没被改
+  expect(note(await compose())).toBeUndefined()
+})
+
 test('关掉建议后，轮次结束不再调用模型', async ($, on) => {
   let calls = 0
   mock.store(on, { prefs: { style: 'structured', suggest: false } })
