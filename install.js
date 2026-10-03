@@ -10,7 +10,7 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 const MIN_CLAUDE = [2, 1, 287]; // 提示词助手依赖的函数钩子插件接口从这个版本起可用
 
 function parseArgs(argv) {
