@@ -1,12 +1,7 @@
 export type Busy = 'enhancing' | 'suggesting' | null
-export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type Style = 'structured' | 'concise' | 'technical' | 'creative'
 
 export type Prefs = {
-  /** 本会话发送用的模型；null = 跟随会话（/model 的设置） */
-  model: string | null
-  /** 本会话发送用的推理强度；null = 跟随会话 */
-  effort: Effort | null
   /** 增强提示词的风格 */
   style: Style
   /** 每轮结束后是否生成"下一步"建议 */

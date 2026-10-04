@@ -88,7 +88,7 @@ function ingest(st, d) {
     if (u && !d.isSidechain) {
       st.lastCtx = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
     }
-    // 实际回答的模型以回复记录为准：助手栏改发模型、限流降级时，会和会话默认模型不同。<synthetic> 是本地生成的报错提示，不算
+    // 实际回答的模型以回复记录为准：限流降级等情况下，会和会话默认模型不同。<synthetic> 是本地生成的报错提示，不算
     if (!d.isSidechain && m.model && m.model !== '<synthetic>') st.lastModel = m.model;
     for (const b of m.content) {
       if (b.type !== 'tool_use' || d.isSidechain) continue;

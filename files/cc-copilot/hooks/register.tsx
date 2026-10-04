@@ -1,39 +1,22 @@
 // 输入框上方的助手栏：
-// 1. 发送前选模型和推理强度：只改之后发出的请求，不动 /model 的全局默认；换了模型会在系统提示词里告诉它实际是谁；
-// 2. 「✨ 增强」按所选风格改写草稿（可选，不点就不发生），会参考最近对话，原稿可撤销；
+// 1. 「✨ 增强」按所选风格改写草稿（可选，不点就不发生），会参考最近对话，原稿可撤销；
 //    键盘党：草稿末尾加 ++ 再回车，不发送，改为增强后放回输入框；
-// 3. 每轮结束后预测"下一步"，作为栏内提示和输入框灰字建议（Tab 采用），可关；
-// 4. 「专家」开关：增强和建议先判断任务属于哪个领域，按该领域行家的标准来写；
-// 5. 子代理可见：栏里实时显示每个子代理正在做的那一步，「子代理」面板里看派单原文、最近动作和回报。
+// 2. 每轮结束后预测"下一步"，作为栏内提示和输入框灰字建议（Tab 采用），可关；
+// 3. 「专家」开关：增强和建议先判断任务属于哪个领域，按该领域行家的标准来写；
+// 4. 子代理可见：栏里实时显示每个子代理正在做的那一步，「子代理」面板里看派单原文、最近动作和回报。
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentTrack, Busy, Effort, Prefs, Style } from '../types'
+import type { AgentTrack, Busy, Prefs, Style } from '../types'
 
 const suggestion = atom({ plugin: 'cc-copilot', key: 'suggestion' } as const, null as string | null)
 const busy = atom({ plugin: 'cc-copilot', key: 'busy' } as const, null as Busy)
 const undo = atom({ plugin: 'cc-copilot', key: 'undo' } as const, null as string | null)
 const note = atom({ plugin: 'cc-copilot', key: 'note' } as const, null as string | null)
-const prefs = atom({ plugin: 'cc-copilot', key: 'prefs' } as const, { model: null, effort: null, style: 'structured', suggest: true, expert: true } as Prefs)
+const prefs = atom({ plugin: 'cc-copilot', key: 'prefs' } as const, { style: 'structured', suggest: true, expert: true } as Prefs)
 const isOpen = atom({ plugin: 'cc-copilot', key: 'isOpen' } as const, false)
 const agents = atom({ plugin: 'cc-copilot', key: 'agents' } as const, [] as AgentTrack[])
 
-// null = 跟随会话。换模型后第一条消息要重新计费整段上下文（缓存按模型分开），所以默认不换。
-const MODELS: readonly { id: string | null; label: string }[] = [
-  { id: null, label: '跟随会话' },
-  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
-  { id: 'claude-sonnet-5-5', label: 'Sonnet 5.5' },
-  { id: 'claude-opus-5-5', label: 'Opus 5.5' },
-  { id: 'claude-fable-5-1', label: 'Fable 5.1' },
-]
-const EFFORTS: readonly { id: Effort | null; label: string }[] = [
-  { id: null, label: '跟随会话' },
-  { id: 'low', label: '低' },
-  { id: 'medium', label: '中' },
-  { id: 'high', label: '高' },
-  { id: 'xhigh', label: '很高' },
-  { id: 'max', label: '最高' },
-]
 const STYLES: readonly { id: Style; label: string; rule: string }[] = [
   {
     id: 'structured',
@@ -138,7 +121,7 @@ const mmss = (ms: number) => {
 async function setPrefs($: EngineInterface, patch: Partial<Prefs>) {
   const p = { ...(await read($, prefs)), ...patch }
   await update($, prefs, () => p)
-  // 风格和建议开关跨会话记住；模型和强度只在本会话有效，免得下次开工忘了自己还挂在别的模型上
+  // 风格和开关跨会话记住
   await $.store.set(STORE_KEY, { style: p.style, suggest: p.suggest, expert: p.expert })
 }
 
@@ -228,34 +211,6 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // 发送前选的模型/强度在这里生效：改写主会话的每个模型请求，子代理不动
-  on('turn.step', async function* ($, e, next) {
-    const p = await read($, prefs)
-    if (e.agentId !== undefined || (p.model === null && p.effort === null)) {
-      return yield* next(e)
-    }
-    const model = p.model ?? e.model
-    const effort = p.effort ?? e.effort
-    // Haiku 不接受推理强度参数，带上会被拒
-    if (/haiku/i.test(model) || effort === undefined) {
-      const { effort: _dropped, ...rest } = e
-      return yield* next({ ...rest, model })
-    }
-    return yield* next({ ...e, model, effort })
-  })
-
-  // 系统提示词里"你是哪个模型"那句按会话模型写死，插件改不到；只改请求不补这段，模型会照着那句自称会话模型。
-  // 子代理不走这里（它们的请求也没被改写）；teammate 是别的循环借用主提示词，同样不补。
-  on('prompt.compose', async ($, e, next) => {
-    const r = await next(e)
-    const { model } = await read($, prefs)
-    if (model === null || model === e.model.replace(/\[1m\]$/i, '') || e.traits.includes('teammate')) return r
-    const label = labelOf(MODELS, model)
-    const text = `# 本会话实际回答的模型
-助手栏把主对话的请求改由 ${label}（模型 ID：${model}）发送，你就是 ${label}。上文按会话默认模型 ${e.model} 写的"你是哪个模型"的说法不适用于你；说明自己是哪个模型时以这里为准。`
-    return { sections: [...r.sections, { id: 'cc-copilot:model', text, scope: 'session' as const }] }
-  })
-
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     // 只给主会话出建议；子代理、被打断、没有文字回复的轮次跳过
@@ -332,13 +287,6 @@ export const register: Register = on => {
         <Text dimColor>{n}</Text>
       ) : null
 
-    const modelButton = (
-      <Button key="model" label={`模型 ${labelOf(MODELS, p.model)}`} hotkey="m" variant={p.model ? 'primary' : 'secondary'} dimColor={!p.model} onPress={() => setPrefs($, { model: nextOf(MODELS, p.model) })} />
-    )
-    const effortButton = (
-      <Button key="effort" label={`强度 ${labelOf(EFFORTS, p.effort)}`} hotkey="r" variant={p.effort ? 'primary' : 'secondary'} dimColor={!p.effort} onPress={() => setPrefs($, { effort: nextOf(EFFORTS, p.effort) })} />
-    )
-
     return (
       <Box flexDirection="column">
         {agentRows}
@@ -357,25 +305,15 @@ export const register: Register = on => {
               }}
             />
           ) : null}
-          {/* 收起时，只有偏离默认的模型/强度才露出来，提醒"这条消息不是按默认发的" */}
-          {!open && p.model ? modelButton : null}
-          {!open && p.effort ? effortButton : null}
           <Button key="more" label={open ? '收起' : '设置'} hotkey="o" dimColor onPress={() => update($, isOpen, v => !v)} />
         </Box>
         {open ? (
-          <Box flexDirection="column">
-            <Box gap={1}>
-              <Text dimColor>发送</Text>
-              {modelButton}
-              {effortButton}
-            </Box>
-            <Box gap={1}>
-              <Text dimColor>增强</Text>
-              <Button key="style" label={`风格 ${labelOf(STYLES, p.style)}`} hotkey="s" dimColor onPress={() => setPrefs($, { style: nextOf(STYLES, p.style) })} />
-              <Button key="expert" label={`专家 ${p.expert ? '开' : '关'}`} hotkey="x" dimColor onPress={() => setPrefs($, { expert: !p.expert })} />
-              <Text dimColor>建议</Text>
-              <Button key="suggest" label={p.suggest ? '开' : '关'} hotkey="n" dimColor onPress={() => setPrefs($, { suggest: !p.suggest })} />
-            </Box>
+          <Box gap={1}>
+            <Text dimColor>增强</Text>
+            <Button key="style" label={`风格 ${labelOf(STYLES, p.style)}`} hotkey="s" dimColor onPress={() => setPrefs($, { style: nextOf(STYLES, p.style) })} />
+            <Button key="expert" label={`专家 ${p.expert ? '开' : '关'}`} hotkey="x" dimColor onPress={() => setPrefs($, { expert: !p.expert })} />
+            <Text dimColor>建议</Text>
+            <Button key="suggest" label={p.suggest ? '开' : '关'} hotkey="n" dimColor onPress={() => setPrefs($, { suggest: !p.suggest })} />
           </Box>
         ) : null}
       </Box>
