@@ -1,5 +1,6 @@
 // 输入框上方的助手栏：
-// 1. 「✨ 增强」按所选风格改写草稿（可选，不点就不发生），会参考最近对话，原稿可撤销；
+// 1. 「✨ 增强」按所选风格改写草稿（可选，不点就不发生），会参考最近对话、这几轮读写过的文件和命令、项目 CLAUDE.md 开头，原稿可撤销；栏里写明参考了什么；
+//    进行中可点「取消」，超过 60 秒自动放弃，两种情况原稿都不动；
 //    键盘党：草稿末尾加 ++ 再回车，不发送，改为增强后放回输入框；
 // 2. 每轮结束后预测"下一步"，作为栏内提示和输入框灰字建议（Tab 采用），可关；
 // 3. 「专家」开关：增强和建议先判断任务属于哪个领域，按该领域行家的标准来写；
@@ -46,13 +47,20 @@ const EXPERT_SUGGEST = '先判断任务所属的专业领域，优先建议该�
 const PANE = 'subagents'
 
 const ENHANCE_MARK = /\s*\+\+\s*$/
+// 草稿不超过这个字数时，默认风格自动降为精简
+const SHORT_DRAFT = 20
+// 增强最多等这么久；Sonnet 写满 1500 token 通常 20～30 秒，留一倍余量
+const ENHANCE_TIMEOUT_MS = 60_000
+// 正在进行的那次增强；「取消」按钮通过它中止。放在模块级是因为按钮的处理器和发起增强的处理器不是同一个
+let enhancing: AbortController | null = null
 const STORE_KEY = 'prefs'
 
 const enhanceSystem = (rule: string, expert = false) => `你是提示词优化助手。用户会给你一段准备发给 Claude Code（能读写文件、运行命令、调研和写作的 AI 工作搭档）的草稿，把它改写成更清晰、可直接执行的指令。
 规则：
 - 保留原意、语言和口吻；不添加草稿和对话里都没有的事实、数字、文件名、客户名。
 - ${rule}${expert ? `\n- ${EXPERT_RULE}` : ''}
-- 你会看到"最近对话"作为背景：草稿里的"这个/这些/它/刚才那个"能从对话里确定指什么，就直接写明，不要再问。
+- 你会看到"最近对话"作为背景：草稿里的"这个/这些/它/刚才那个"能从对话里确定指什么，就直接写明，不要再问。对话里"动作"一行列的是助手真实读写过的文件、跑过的命令，草稿说"那个文件/刚改的/刚才跑的"时直接点名。
+- 你可能看到"项目规则"（仓库 CLAUDE.md 的开头）：改写后的指令不要和它冲突，但不要把规则原文抄进指令。
 - 只有对话也回答不了、并且会实质影响结果的缺口，才用【待补充：…】标出，最多 2 处；做事方式（先确认还是直接做、优先级）不算缺口，不要标。
 - 不写客套话。只输出改写后的提示词本身，不加解释、不加引号。`
 
@@ -125,43 +133,135 @@ async function setPrefs($: EngineInterface, patch: Partial<Prefs>) {
   await $.store.set(STORE_KEY, { style: p.style, suggest: p.suggest, expert: p.expert })
 }
 
-async function recentContext($: EngineInterface) {
-  const all = await $.session.messages()
-  if (!Array.isArray(all)) return ''
-  return all
-    .filter(m => m.text?.trim())
-    .slice(-6)
-    .map(m => `${m.role === 'user' ? '用户' : '助手'}：${clip(m.text.trim(), 600)}`)
-    .join('\n')
+// 背景材料：最近对话 + 这几轮助手真实做过的事 + 项目规则。返回正文和参考范围（显示给用户，让他知道增强依据了什么）
+type Context = { text: string; turns: number; files: number; hasRules: boolean }
+
+// 工具调用压成"动作"短语：只保留能让改写点名的信息（文件路径、命令、派单描述）
+function describeUse(u: { tool: string; input: Record<string, unknown> }): { verb: string; what: string } | null {
+  const i = u.input
+  const file = typeof i.file_path === 'string' ? i.file_path : typeof i.path === 'string' ? i.path : ''
+  switch (u.tool) {
+    case 'Read':
+      return file ? { verb: '读', what: file } : null
+    case 'Edit':
+    case 'MultiEdit':
+    case 'Write':
+    case 'NotebookEdit':
+      return file ? { verb: '改', what: file } : null
+    case 'Bash':
+    case 'PowerShell':
+      return { verb: '跑', what: String(i.description ?? i.command ?? '') }
+    case 'Agent':
+    case 'Task':
+      return { verb: '派子代理', what: String(i.description ?? '') }
+    case 'Grep':
+    case 'Glob':
+      return { verb: '搜', what: String(i.pattern ?? '') }
+    default:
+      return null
+  }
 }
 
-async function enhance($: EngineInterface, draft: string) {
+async function recentContext($: EngineInterface): Promise<Context> {
+  const all = await $.session.messages()
+  const files = new Set<string>()
+  const lines: string[] = []
+  const recent = Array.isArray(all) ? all.filter(m => m.text?.trim() || m.toolUses?.length).slice(-10) : []
+  for (const m of recent) {
+    if (m.text?.trim()) lines.push(`${m.role === 'user' ? '用户' : '助手'}：${clip(m.text.trim(), 600)}`)
+    // 同一条消息里的动作按动词归并：读 a、b；改 c；跑 xxx
+    const byVerb = new Map<string, string[]>()
+    for (const u of m.toolUses ?? []) {
+      const d = describeUse(u)
+      if (!d || !d.what) continue
+      if (d.verb === '读' || d.verb === '改') files.add(d.what)
+      const list = byVerb.get(d.verb) ?? []
+      if (!list.includes(d.what)) list.push(d.what)
+      byVerb.set(d.verb, list)
+    }
+    if (byVerb.size) {
+      const acts = [...byVerb].map(([verb, what]) => `${verb} ${what.slice(0, 6).map(w => clip(w.replace(/\s+/g, ' '), 80)).join('、')}${what.length > 6 ? ` 等 ${what.length} 项` : ''}`)
+      lines.push(`  动作：${acts.join('；')}`)
+    }
+  }
+  // 项目规则只取开头：够看出项目是什么、有哪些硬约束；读不到（没有这个文件）就不带
+  let rules = ''
+  try {
+    const raw = await $.fs.read('CLAUDE.md')
+    if (typeof raw === 'string') rules = clip(raw.trim(), 1500)
+  } catch {
+    rules = ''
+  }
+  const parts: string[] = []
+  if (rules) parts.push(`项目规则（仓库 CLAUDE.md 开头，改写要遵守、不要抄入）：\n${rules}`)
+  if (lines.length) parts.push(`最近对话（仅作背景，不要改写它）：\n${lines.join('\n')}`)
+  return { text: parts.join('\n\n'), turns: recent.length, files: files.size, hasRules: Boolean(rules) }
+}
+
+// 参考范围的一句话，显示在栏里
+const describeContext = (c: Context) => {
+  const bits: string[] = []
+  if (c.turns) bits.push(`最近 ${c.turns} 条对话`)
+  if (c.files) bits.push(`${c.files} 个文件`)
+  if (c.hasRules) bits.push('项目规则')
+  return bits.length ? `参考了${bits.join('、')}` : '没有可参考的对话和项目规则'
+}
+
+// from：按钮点的，还是草稿末尾 ++ 回车触发的。++ 是把提交拦下来的，输入框可能已清空，失败时要把原稿放回去
+async function enhance($: EngineInterface, draft: string, from: 'button' | 'mark' = 'button') {
   const text = draft.replace(ENHANCE_MARK, '').trim()
   if (!text) {
     $.ui.toast('先在输入框写个草稿，再点增强')
     return
   }
+  // 已有一次在跑就不再发第二次，否则「取消」不知道该停哪个，撤销也会存错原稿
+  if ((await read($, busy)) === 'enhancing') {
+    $.ui.toast('正在增强，等它完成或点取消')
+    return
+  }
+  const stop = new AbortController()
+  enhancing = stop
   await update($, busy, () => 'enhancing')
   await update($, note, () => null)
+  const restore = async () => {
+    if (from !== 'mark') return
+    if (!(await $.prompt.read()).text.trim()) await $.prompt.fill({ text, mode: 'replace' })
+  }
   try {
     const { style, expert } = await read($, prefs)
-    const rule = STYLES.find(s => s.id === style)?.rule ?? STYLES[0]!.rule
+    // 默认风格下，很短的草稿不套结构骨架，按精简处理，免得一句话被撑成一页
+    const effective: Style = style === 'structured' && text.length <= SHORT_DRAFT ? 'concise' : style
+    const rule = STYLES.find(s => s.id === effective)?.rule ?? STYLES[0]!.rule
     const context = await recentContext($)
-    const r = await $.model.complete({
-      model: 'sonnet',
-      system: enhanceSystem(rule, expert),
-      prompt: `${context ? `最近对话（仅作背景，不要改写它）：\n${context}\n\n` : ''}草稿：\n${text}`,
-      maxTokens: 1500,
-    })
+    const r = await $.model.complete(
+      {
+        model: 'sonnet',
+        system: enhanceSystem(rule, expert),
+        prompt: `${context.text ? `${context.text}\n\n` : ''}草稿：\n${text}`,
+        maxTokens: 1500,
+        timeoutMs: ENHANCE_TIMEOUT_MS,
+      },
+      { signal: stop.signal },
+    )
+    // 用户已取消：哪怕模型恰好在这一刻返回了，也不往输入框里填
+    if (stop.signal.aborted) {
+      await update($, note, () => '已取消，原稿未改动')
+      await restore()
+      return
+    }
     if (!r.isAnswered) {
       // 失败要说出来，原稿留在输入框不动
-      await update($, note, () => `增强失败（${r.reason}），原稿未改动`)
+      const why = r.reason === 'aborted' ? `增强超时（${ENHANCE_TIMEOUT_MS / 1000} 秒）` : `增强失败（${r.reason}）`
+      await update($, note, () => `${why}，原稿未改动`)
+      await restore()
       return
     }
     await update($, undo, () => text)
     const filled = await $.prompt.fill({ text: r.text.trim(), mode: 'replace' })
-    await update($, note, () => (filled.isFilled ? '已增强，检查后回车；不满意按撤销' : '输入框暂时不可写，稍后再试'))
+    const how = effective !== style ? `草稿短，按精简处理，${describeContext(context)}` : describeContext(context)
+    await update($, note, () => (filled.isFilled ? `已增强（${how}），检查后回车；不满意按撤销` : '输入框暂时不可写，稍后再试'))
   } finally {
+    if (enhancing === stop) enhancing = null
     await update($, busy, () => null)
   }
 }
@@ -200,7 +300,7 @@ export const register: Register = on => {
     // 只拦截本人在输入框里打的 ++，插件自己发出的提示不处理
     if (e.origin?.kind === 'composer') {
       if (ENHANCE_MARK.test(e.text) && e.text.replace(ENHANCE_MARK, '').trim()) {
-        void enhance($, e.text)
+        void enhance($, e.text, 'mark')
         return { drop: '✨ 正在增强提示词，完成后会放回输入框' }
       }
     }
@@ -276,7 +376,7 @@ export const register: Register = on => {
 
     const status =
       state === 'enhancing' ? (
-        <Text color="yellow">✨ 正在增强…</Text>
+        <Text color="yellow">✨ 正在增强…<Text dimColor>（最多 {ENHANCE_TIMEOUT_MS / 1000} 秒，可点取消）</Text></Text>
       ) : s ? (
         <Text>
           <Text dimColor>下一步 </Text>
@@ -292,7 +392,12 @@ export const register: Register = on => {
         {agentRows}
         {status ? <Box>{status}</Box> : null}
         <Box gap={1}>
-          <Button key="enhance" label="✨ 增强" hotkey="e" onPress={async () => enhance($, (await $.prompt.read()).text)} />
+          {state === 'enhancing' ? (
+            // 快捷键不用 e：增强中误按两下不该变成取消
+            <Button key="cancel" label="取消" hotkey="c" onPress={() => enhancing?.abort()} />
+          ) : (
+            <Button key="enhance" label="✨ 增强" hotkey="e" onPress={async () => enhance($, (await $.prompt.read()).text)} />
+          )}
           {u ? (
             <Button
               key="undo"
